@@ -28,6 +28,11 @@ medium.db
 raindrop.db
 docs.db
 docs.db.wal
+snowflake.db
+
+# Output directories (docs_obsidian can be very large)
+docs_obsidian/
+snowflake_obsidian/
 
 # Sync logs
 sync.log

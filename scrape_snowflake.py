@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Databricks Blog Scraper - Scrapes all Databricks blog posts to Obsidian markdown.
+Snowflake Blog Scraper - Scrapes Snowflake blog posts to Obsidian markdown.
 
-Fetches blog post URLs from sitemap XML, then downloads content via Gatsby
-page-data JSON endpoints (no browser required). Saves as Obsidian markdown
-with tags: clipping, databricks.
+Fetches blog post URLs from sitemap XML, then downloads content via standard
+HTTP requests + BeautifulSoup HTML parsing (no browser required). Saves as
+Obsidian markdown with tags: clippings, snowflake.
 
 Commands:
     discover    Fetch sitemap and add new posts to database
@@ -41,13 +41,13 @@ from bs4 import BeautifulSoup
 # =============================================================================
 
 class Config:
-    """Configuration manager for blog scraper (reads [blogs] section from TOML)"""
+    """Configuration manager for Snowflake blog scraper (reads [snowflake] section from TOML)"""
 
     DEFAULT_CONFIG = {
-        'blogs': {
-            'staging_dir': 'blogs_obsidian',
+        'snowflake': {
+            'staging_dir': 'snowflake_obsidian',
             'obsidian_vault': '',
-            'database': 'blogs.db',
+            'database': 'snowflake.db',
             'delay': 1.0,
             'max_retries': 3,
             'max_workers': 4,
@@ -88,21 +88,21 @@ class Config:
                 base[key] = value
 
     def get(self, key, default=None):
-        """Get a config value from [blogs] section"""
+        """Get a config value from [snowflake] section"""
         if self._config is None:
             self.load()
-        return self._config.get('blogs', {}).get(key, default)
+        return self._config.get('snowflake', {}).get(key, default)
 
     def set(self, key, value):
-        """Set a config value in local config [blogs] section"""
+        """Set a config value in local config [snowflake] section"""
         local_config = {}
         if self.local_config_file.exists():
             with open(self.local_config_file, 'rb') as f:
                 local_config = tomllib.load(f)
 
-        if 'blogs' not in local_config:
-            local_config['blogs'] = {}
-        local_config['blogs'][key] = value
+        if 'snowflake' not in local_config:
+            local_config['snowflake'] = {}
+        local_config['snowflake'][key] = value
 
         self._write_toml(self.local_config_file, local_config)
         self._config = None
@@ -119,6 +119,9 @@ class Config:
                         lines.append(f'{key} = "{value}"')
                     elif isinstance(value, bool):
                         lines.append(f'{key} = {str(value).lower()}')
+                    elif isinstance(value, list):
+                        items = ', '.join(f'"{v}"' for v in value)
+                        lines.append(f'{key} = [{items}]')
                     else:
                         lines.append(f'{key} = {value}')
                 lines.append('')
@@ -128,7 +131,7 @@ class Config:
 
     @property
     def staging_dir(self):
-        return self.get('staging_dir', 'blogs_obsidian')
+        return self.get('staging_dir', 'snowflake_obsidian')
 
     @property
     def obsidian_vault(self):
@@ -136,7 +139,7 @@ class Config:
 
     @property
     def database_path(self):
-        return self.get('database', 'blogs.db')
+        return self.get('database', 'snowflake.db')
 
     @property
     def delay(self):
@@ -155,11 +158,11 @@ class Config:
 # Database
 # =============================================================================
 
-class BlogDatabase:
-    """DuckDB database manager for tracking blog posts"""
+class SnowflakeDatabase:
+    """DuckDB database manager for tracking Snowflake blog posts"""
 
     SCHEMA = """
-    CREATE TABLE IF NOT EXISTS blog_posts (
+    CREATE TABLE IF NOT EXISTS snowflake_posts (
         id INTEGER PRIMARY KEY,
         slug VARCHAR NOT NULL UNIQUE,
         url VARCHAR NOT NULL,
@@ -174,11 +177,10 @@ class BlogDatabase:
         downloaded_at TIMESTAMP,
         in_obsidian BOOLEAN DEFAULT FALSE,
         moved_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        content_type VARCHAR DEFAULT 'blog'
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS blog_sync_logs (
+    CREATE TABLE IF NOT EXISTS snowflake_sync_logs (
         id INTEGER PRIMARY KEY,
         synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         total_in_sitemap INTEGER,
@@ -188,8 +190,8 @@ class BlogDatabase:
         status VARCHAR
     );
 
-    CREATE SEQUENCE IF NOT EXISTS blog_posts_id_seq;
-    CREATE SEQUENCE IF NOT EXISTS blog_sync_logs_id_seq;
+    CREATE SEQUENCE IF NOT EXISTS snowflake_posts_id_seq;
+    CREATE SEQUENCE IF NOT EXISTS snowflake_sync_logs_id_seq;
     """
 
     def __init__(self, db_path):
@@ -206,11 +208,6 @@ class BlogDatabase:
                     self.conn.execute(statement)
                 except Exception:
                     pass
-        # Migration: add content_type column if missing (existing DBs)
-        try:
-            self.conn.execute("ALTER TABLE blog_posts ADD COLUMN content_type VARCHAR DEFAULT 'blog'")
-        except Exception:
-            pass
         return self
 
     def close(self):
@@ -225,13 +222,13 @@ class BlogDatabase:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def add_post(self, slug, url, content_type='blog'):
-        """Add a new blog post (pending status)"""
+    def add_post(self, slug, url):
+        """Add a new post (pending status)"""
         try:
             self.conn.execute("""
-                INSERT INTO blog_posts (id, slug, url, content_type)
-                VALUES (nextval('blog_posts_id_seq'), ?, ?, ?)
-            """, [slug, url, content_type])
+                INSERT INTO snowflake_posts (id, slug, url)
+                VALUES (nextval('snowflake_posts_id_seq'), ?, ?)
+            """, [slug, url])
             return True
         except duckdb.ConstraintException:
             return False
@@ -239,45 +236,37 @@ class BlogDatabase:
     def get_post(self, slug):
         """Get a single post by slug"""
         result = self.conn.execute(
-            "SELECT * FROM blog_posts WHERE slug = ?", [slug]
+            "SELECT * FROM snowflake_posts WHERE slug = ?", [slug]
         ).fetchone()
         if result:
             columns = [
                 'id', 'slug', 'url', 'title', 'author', 'publish_date',
                 'categories', 'word_count', 'char_count', 'file_path',
-                'status', 'downloaded_at', 'in_obsidian', 'moved_at', 'created_at',
-                'content_type'
+                'status', 'downloaded_at', 'in_obsidian', 'moved_at', 'created_at'
             ]
             return dict(zip(columns, result))
         return None
 
-    def get_posts(self, status=None, limit=None, content_type=None):
-        """Get posts, optionally filtered by status and/or content_type"""
-        query = "SELECT id, slug, url, title, author, publish_date, status, file_path, in_obsidian, content_type FROM blog_posts"
+    def get_posts(self, status=None, limit=None):
+        """Get posts, optionally filtered by status"""
+        query = "SELECT id, slug, url, title, author, publish_date, status, file_path, in_obsidian FROM snowflake_posts"
         params = []
-        conditions = []
         if status:
-            conditions.append("status = ?")
+            query += " WHERE status = ?"
             params.append(status)
-        if content_type:
-            conditions.append("content_type = ?")
-            params.append(content_type)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY id"
         if limit:
             query += " LIMIT ?"
             params.append(limit)
         results = self.conn.execute(query, params).fetchall()
-        columns = ['id', 'slug', 'url', 'title', 'author', 'publish_date', 'status', 'file_path', 'in_obsidian', 'content_type']
+        columns = ['id', 'slug', 'url', 'title', 'author', 'publish_date', 'status', 'file_path', 'in_obsidian']
         return [dict(zip(columns, row)) for row in results]
 
     def update_post(self, slug, **kwargs):
         """Update post fields"""
         valid_fields = [
             'title', 'author', 'publish_date', 'categories', 'word_count',
-            'char_count', 'file_path', 'status', 'downloaded_at', 'in_obsidian', 'moved_at',
-            'content_type'
+            'char_count', 'file_path', 'status', 'downloaded_at', 'in_obsidian', 'moved_at'
         ]
         updates = []
         values = []
@@ -288,38 +277,29 @@ class BlogDatabase:
         if updates:
             values.append(slug)
             self.conn.execute(
-                f"UPDATE blog_posts SET {', '.join(updates)} WHERE slug = ?",
+                f"UPDATE snowflake_posts SET {', '.join(updates)} WHERE slug = ?",
                 values
             )
 
-    def get_counts(self, content_type=None):
-        """Get status counts, optionally filtered by content_type"""
-        if content_type:
-            results = self.conn.execute("""
-                SELECT status, COUNT(*) FROM blog_posts WHERE content_type = ? GROUP BY status
-            """, [content_type]).fetchall()
-            counts = {row[0]: row[1] for row in results}
-            total = self.conn.execute(
-                "SELECT COUNT(*) FROM blog_posts WHERE content_type = ?", [content_type]
-            ).fetchone()[0]
-        else:
-            results = self.conn.execute("""
-                SELECT status, COUNT(*) FROM blog_posts GROUP BY status
-            """).fetchall()
-            counts = {row[0]: row[1] for row in results}
-            total = self.conn.execute("SELECT COUNT(*) FROM blog_posts").fetchone()[0]
+    def get_counts(self):
+        """Get status counts"""
+        results = self.conn.execute("""
+            SELECT status, COUNT(*) FROM snowflake_posts GROUP BY status
+        """).fetchall()
+        counts = {row[0]: row[1] for row in results}
+        total = self.conn.execute("SELECT COUNT(*) FROM snowflake_posts").fetchone()[0]
         counts['total'] = total
         return counts
 
     def get_unmoved_posts(self):
         """Get downloaded posts not yet in Obsidian"""
         results = self.conn.execute("""
-            SELECT id, slug, url, title, author, publish_date, file_path, content_type
-            FROM blog_posts
+            SELECT id, slug, url, title, author, publish_date, file_path
+            FROM snowflake_posts
             WHERE status = 'downloaded' AND in_obsidian = FALSE AND file_path IS NOT NULL
             ORDER BY id
         """).fetchall()
-        columns = ['id', 'slug', 'url', 'title', 'author', 'publish_date', 'file_path', 'content_type']
+        columns = ['id', 'slug', 'url', 'title', 'author', 'publish_date', 'file_path']
         return [dict(zip(columns, row)) for row in results]
 
     def mark_moved(self, slugs):
@@ -328,7 +308,7 @@ class BlogDatabase:
             return
         placeholders = ','.join(['?'] * len(slugs))
         self.conn.execute(f"""
-            UPDATE blog_posts
+            UPDATE snowflake_posts
             SET in_obsidian = TRUE, moved_at = CURRENT_TIMESTAMP
             WHERE slug IN ({placeholders})
         """, list(slugs))
@@ -336,47 +316,49 @@ class BlogDatabase:
     def reset_failed(self):
         """Reset failed posts to pending"""
         self.conn.execute("""
-            UPDATE blog_posts SET status = 'pending' WHERE status = 'failed'
+            UPDATE snowflake_posts SET status = 'pending' WHERE status = 'failed'
         """)
         return self.conn.execute(
-            "SELECT COUNT(*) FROM blog_posts WHERE status = 'pending'"
+            "SELECT COUNT(*) FROM snowflake_posts WHERE status = 'pending'"
         ).fetchone()[0]
 
     def add_sync_log(self, total_sitemap, new_found, downloaded, failed, status):
         """Add a sync log entry"""
         self.conn.execute("""
-            INSERT INTO blog_sync_logs (id, total_in_sitemap, new_posts_found,
-                                        posts_downloaded, posts_failed, status)
-            VALUES (nextval('blog_sync_logs_id_seq'), ?, ?, ?, ?, ?)
+            INSERT INTO snowflake_sync_logs (id, total_in_sitemap, new_posts_found,
+                                             posts_downloaded, posts_failed, status)
+            VALUES (nextval('snowflake_sync_logs_id_seq'), ?, ?, ?, ?, ?)
         """, [total_sitemap, new_found, downloaded, failed, status])
 
 
 # =============================================================================
-# Databricks Blog Scraper
+# Snowflake Blog Scraper
 # =============================================================================
 
-class DatabricksBlogScraper:
-    """Handles sitemap parsing and blog content extraction via Gatsby page-data JSON.
+class SnowflakeScraper:
+    """Handles sitemap discovery and blog content extraction via HTML parsing.
 
-    Databricks blog is a Gatsby site backed by Drupal CMS. Each blog post has a
-    static JSON endpoint at a predictable path that contains the full article data
-    (title, author, body HTML, categories, etc.) - no browser needed.
+    Snowflake's blog is a standard web application. We fetch blog post URLs
+    from their XML sitemap, then scrape each post's HTML to extract the article
+    content — no browser needed.
 
-    Two URL patterns exist:
-      New:    /blog/{slug}          -> /en-blog-assets/page-data/blog/{slug}/page-data.json
-      Legacy: /blog/YYYY/MM/DD/X.html -> /blog-legacy-assets/page-data/blog/YYYY/MM/DD/X.html/page-data.json
+    Blog URL pattern:
+      https://www.snowflake.com/blog/{slug}/
     """
 
-    SITEMAP_INDEX_URL = 'https://www.databricks.com/webshared/sitemaps/sitemap-index.xml'
-    BLOG_URL_PREFIX = 'https://www.databricks.com/blog/'
-    BASE_URL = 'https://www.databricks.com'
+    # Sitemap entry points to try in order
+    SITEMAP_URLS = [
+        'https://www.snowflake.com/sitemap.xml',
+        'https://www.snowflake.com/sitemap_index.xml',
+        'https://www.snowflake.com/blog/sitemap.xml',
+    ]
 
-    # Page-data JSON path templates
-    NEW_PAGE_DATA = '/en-blog-assets/page-data/blog/{path}/page-data.json'
-    LEGACY_PAGE_DATA = '/blog-legacy-assets/page-data/blog/{path}/page-data.json'
+    BLOG_URL_PREFIXES = [
+        'https://www.snowflake.com/blog/',
+        'https://www.snowflake.com/en-us/blog/',
+    ]
 
-    # Sitemap index entries that contain English blog posts
-    BLOG_SITEMAP_KEYWORDS = ['en-blog-assets', 'blog-legacy-assets']
+    BASE_URL = 'https://www.snowflake.com'
 
     def __init__(self):
         self.session = requests.Session()
@@ -385,6 +367,8 @@ class DatabricksBlogScraper:
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             ),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
         })
 
     # -------------------------------------------------------------------------
@@ -392,369 +376,349 @@ class DatabricksBlogScraper:
     # -------------------------------------------------------------------------
 
     def fetch_sitemap_urls(self):
-        """Fetch all blog post URLs from Databricks sitemaps.
+        """Fetch all blog post URLs from Snowflake sitemaps.
 
-        Walks: sitemap-index.xml -> blog sitemap indexes -> sitemap-0.xml files
+        Tries multiple sitemap entry points; walks nested sitemap indexes.
+        Returns list of {'url': ..., 'slug': ...} dicts.
         """
         ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         all_urls = []
 
-        print("  Fetching sitemap index...")
-        top_sitemaps = self._fetch_sitemap_entries(self.SITEMAP_INDEX_URL, ns)
-        if not top_sitemaps:
-            return []
+        # Try each entry point until we find one that works
+        for entry_url in self.SITEMAP_URLS:
+            print(f"  Trying sitemap: {entry_url}")
+            try:
+                resp = self.session.get(entry_url, timeout=30)
+                if resp.status_code == 404:
+                    print(f"    Not found (404)")
+                    continue
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                print(f"    Error: {e}")
+                continue
 
-        blog_indexes = [u for u in top_sitemaps
-                        if any(kw in u for kw in self.BLOG_SITEMAP_KEYWORDS)]
-        print(f"  Found {len(blog_indexes)} blog sitemap indexes")
+            root = ElementTree.fromstring(resp.content)
 
-        for index_url in blog_indexes:
-            print(f"  Fetching: {index_url}")
-            sub_sitemaps = self._fetch_sitemap_entries(index_url, ns)
-            for sub_url in (sub_sitemaps or []):
-                print(f"    Fetching: {sub_url}")
-                urls = self._fetch_blog_urls(sub_url, ns)
+            # Check if this is a sitemap index (contains <sitemap> elements)
+            child_sitemaps = root.findall('.//sm:sitemap/sm:loc', ns)
+
+            if child_sitemaps:
+                print(f"  Found sitemap index with {len(child_sitemaps)} entries")
+                blog_sitemaps = [
+                    loc.text.strip() for loc in child_sitemaps
+                    if 'blog' in loc.text.lower()
+                ]
+                other_sitemaps = [
+                    loc.text.strip() for loc in child_sitemaps
+                    if 'blog' not in loc.text.lower()
+                ]
+
+                # Prioritize blog-specific sitemaps; fall back to all
+                to_process = blog_sitemaps if blog_sitemaps else [
+                    loc.text.strip() for loc in child_sitemaps
+                ]
+                print(f"  Processing {len(to_process)} sitemap(s)")
+
+                for sub_url in to_process:
+                    print(f"    Fetching: {sub_url}")
+                    urls = self._fetch_blog_urls_from_sitemap(sub_url, ns)
+                    all_urls.extend(urls)
+                    if urls:
+                        print(f"    -> {len(urls)} blog URLs")
+
+            else:
+                # Direct sitemap (contains <url> elements)
+                print(f"  Processing as direct sitemap")
+                urls = self._extract_blog_urls(root, ns)
                 all_urls.extend(urls)
-                print(f"    -> {len(urls)} blog URLs")
+                print(f"  -> {len(urls)} blog URLs")
+
+            if all_urls:
+                break  # Found URLs, no need to try other entry points
 
         return all_urls
 
-    def _fetch_sitemap_entries(self, url, ns):
-        """Fetch <sitemap><loc> entries from a sitemap index XML"""
+    def _fetch_blog_urls_from_sitemap(self, url, ns):
+        """Fetch a child sitemap and extract blog URLs"""
         try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            root = ElementTree.fromstring(response.content)
-            return [loc.text.strip() for loc in root.findall('.//sm:sitemap/sm:loc', ns)]
+            resp = self.session.get(url, timeout=30)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            root = ElementTree.fromstring(resp.content)
         except Exception as e:
-            print(f"  Error fetching {url}: {e}")
+            print(f"    Error fetching {url}: {e}")
             return []
 
-    def _fetch_blog_urls(self, url, ns):
-        """Fetch <url><loc> entries from a sitemap and extract blog URLs"""
-        try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            root = ElementTree.fromstring(response.content)
-        except Exception as e:
-            print(f"  Error fetching {url}: {e}")
-            return []
+        # Might be another index
+        child_sitemaps = root.findall('.//sm:sitemap/sm:loc', ns)
+        if child_sitemaps:
+            all_urls = []
+            for loc in child_sitemaps:
+                sub_url = loc.text.strip()
+                if 'blog' in sub_url.lower() or not child_sitemaps:
+                    all_urls.extend(self._fetch_blog_urls_from_sitemap(sub_url, ns))
+            return all_urls
 
+        return self._extract_blog_urls(root, ns)
+
+    def _extract_blog_urls(self, root, ns):
+        """Extract blog post URLs from a <urlset> sitemap root"""
         urls = []
         for loc in root.findall('.//sm:url/sm:loc', ns):
-            blog_url = loc.text.strip()
-            if blog_url.startswith(self.BLOG_URL_PREFIX):
-                slug = self._url_to_slug(blog_url)
+            raw_url = loc.text.strip()
+            if self._is_blog_url(raw_url):
+                slug = self._url_to_slug(raw_url)
                 if slug:
-                    urls.append({'url': blog_url, 'slug': slug})
+                    urls.append({'url': raw_url, 'slug': slug})
         return urls
+
+    def _is_blog_url(self, url):
+        """Return True if URL looks like a Snowflake blog post"""
+        for prefix in self.BLOG_URL_PREFIXES:
+            if url.startswith(prefix):
+                path = url[len(prefix):].strip('/')
+                # Skip listing/pagination/category pages
+                if not path:
+                    return False
+                if re.match(r'^(page|category|tag|author|wp-json|feed|archive)(/|$)', path):
+                    return False
+                if re.match(r'^\d+$', path):  # Pure number = pagination
+                    return False
+                return True
+        return False
 
     def _url_to_slug(self, url):
-        """Convert blog URL to a unique slug for the database.
-
-        New:    https://www.databricks.com/blog/some-slug -> some-slug
-        Legacy: https://www.databricks.com/blog/2020/09/17/some-slug.html -> 2020-09-17-some-slug
-        """
-        path = url.replace(self.BLOG_URL_PREFIX, '').strip('/')
-        if not path or path.startswith(('page/', 'category/', 'tag/', 'author/')):
-            return None
-
-        legacy_match = re.match(r'^(\d{4})/(\d{2})/(\d{2})/(.+?)(?:\.html)?$', path)
-        if legacy_match:
-            year, month, day, name = legacy_match.groups()
-            return f"{year}-{month}-{day}-{name}"
-
-        if '/' not in path:
-            return path
+        """Convert blog URL to a database slug"""
+        for prefix in self.BLOG_URL_PREFIXES:
+            if url.startswith(prefix):
+                slug = url[len(prefix):].strip('/')
+                # Normalize: replace slashes with hyphens for dated paths
+                slug = slug.replace('/', '-')
+                return slug if slug else None
         return None
 
-    def _url_to_page_data_urls(self, url):
-        """Convert a blog URL to Gatsby page-data JSON URLs (primary + fallback).
-
-        Some new-style URLs are served by the legacy Gatsby app, so we return
-        both paths and try them in order.
-
-        Returns list of URLs to try: [primary, fallback]
-        """
-        path = url.replace(self.BLOG_URL_PREFIX, '').strip('/')
-
-        legacy_match = re.match(r'^(\d{4}/\d{2}/\d{2}/.+\.html)$', path)
-        if legacy_match:
-            # Legacy URL: try legacy first, then new
-            return [
-                f"{self.BASE_URL}{self.LEGACY_PAGE_DATA.format(path=path)}",
-                f"{self.BASE_URL}{self.NEW_PAGE_DATA.format(path=path)}",
-            ]
-
-        # New-style URL: try new first, then legacy
-        return [
-            f"{self.BASE_URL}{self.NEW_PAGE_DATA.format(path=path)}",
-            f"{self.BASE_URL}{self.LEGACY_PAGE_DATA.format(path=path)}",
-        ]
-
     # -------------------------------------------------------------------------
-    # Glossary sitemap discovery
+    # Content scraping via HTML
     # -------------------------------------------------------------------------
 
-    GLOSSARY_SITEMAP_URL = 'https://www.databricks.com/glossaries-assets/sitemap/sitemap-index.xml'
-    GLOSSARY_URL_PREFIX = 'https://www.databricks.com/glossary/'
-    GLOSSARY_PAGE_DATA = '/glossaries-assets/page-data/glossary/{slug}/page-data.json'
+    def scrape_post(self, url, retries=3):
+        """Fetch blog post HTML and extract article content.
 
-    def fetch_glossary_urls(self):
-        """Fetch all glossary page URLs from Databricks glossary sitemap.
-
-        Walks: glossaries-assets/sitemap/sitemap-index.xml -> sitemap-0.xml files
-        Filters to English-only URLs (skips /de/, /fr/, etc.)
+        Returns dict with title, authors, date, description, content, categories
+        or None on failure.
         """
-        ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        all_urls = []
-
-        print("  Fetching glossary sitemap index...")
-        sub_sitemaps = self._fetch_sitemap_entries(self.GLOSSARY_SITEMAP_URL, ns)
-        if not sub_sitemaps:
-            return []
-
-        print(f"  Found {len(sub_sitemaps)} glossary sub-sitemaps")
-
-        for sub_url in sub_sitemaps:
-            print(f"    Fetching: {sub_url}")
-            urls = self._fetch_glossary_urls_from_sitemap(sub_url, ns)
-            all_urls.extend(urls)
-            print(f"    -> {len(urls)} glossary URLs")
-
-        return all_urls
-
-    def _fetch_glossary_urls_from_sitemap(self, url, ns):
-        """Fetch <url><loc> entries from a sitemap and extract glossary URLs (English only)"""
-        try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            root = ElementTree.fromstring(response.content)
-        except Exception as e:
-            print(f"  Error fetching {url}: {e}")
-            return []
-
-        urls = []
-        for loc in root.findall('.//sm:url/sm:loc', ns):
-            page_url = loc.text.strip()
-            if not page_url.startswith(self.GLOSSARY_URL_PREFIX):
-                continue
-            # Skip non-English: /de/glossary/, /fr/glossary/, etc.
-            if re.search(r'databricks\.com/[a-z]{2}/glossary/', page_url):
-                continue
-            slug = page_url.replace(self.GLOSSARY_URL_PREFIX, '').strip('/')
-            if slug and '/' not in slug:
-                urls.append({'url': page_url, 'slug': f'glossary-{slug}'})
-        return urls
-
-    def scrape_glossary(self, slug, retries=3):
-        """Fetch glossary page data from Gatsby page-data JSON endpoint.
-
-        The DB slug is prefixed with 'glossary-', so we strip it to get the URL slug.
-        JSON path: result.data.drupal.glossaryPage
-        """
-        # Strip the 'glossary-' prefix to get the actual URL slug
-        url_slug = slug.replace('glossary-', '', 1)
-        page_data_url = f"{self.BASE_URL}{self.GLOSSARY_PAGE_DATA.format(slug=url_slug)}"
-
         for attempt in range(retries):
             try:
-                response = self.session.get(page_data_url, timeout=30)
-                if response.status_code == 404:
+                resp = self.session.get(url, timeout=30)
+
+                if resp.status_code == 404:
                     return None
-                response.raise_for_status()
-                data = response.json()
-
-                glossary_page = (data.get('result', {})
-                                 .get('data', {})
-                                 .get('drupal', {})
-                                 .get('glossaryPage', {}))
-
-                if not glossary_page:
+                if resp.status_code == 403:
                     return None
 
-                title = glossary_page.get('title')
-                if not title:
-                    return None
-
-                # Description from metatags
-                description = ''
-                for mt in (glossary_page.get('entityMetatags') or []):
-                    if isinstance(mt, dict) and mt.get('key') == 'description':
-                        description = mt.get('value', '')
-                        break
-
-                # Content: concatenate all fieldComponents body sections
-                body_parts = []
-                for component in (glossary_page.get('fieldComponents') or []):
-                    entity = (component or {}).get('entity') or {}
-                    field_body = entity.get('fieldBody') or {}
-                    processed = field_body.get('processed', '')
-                    if processed:
-                        body_parts.append(processed)
-
-                body_html = '\n'.join(body_parts)
-                if not body_html or len(body_html) < 50:
-                    return None
-
-                content = self._html_to_markdown(body_html)
-                if not content or len(content) < 100:
-                    return None
-
-                return {
-                    'title': title,
-                    'authors': [],
-                    'date': None,
-                    'description': description,
-                    'summary': '',
-                    'categories': None,
-                    'content': content,
-                }
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                return self._parse_article(soup, url)
 
             except requests.exceptions.RequestException:
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
                 else:
                     return None
-            except (json.JSONDecodeError, KeyError, TypeError):
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    return None
 
         return None
 
-    # -------------------------------------------------------------------------
-    # Content scraping via page-data JSON
-    # -------------------------------------------------------------------------
+    def _parse_article(self, soup, url):
+        """Extract article fields from parsed HTML"""
 
-    def scrape_post(self, url, retries=3):
-        """Fetch blog post data from Gatsby page-data JSON endpoint.
+        # --- Title ---
+        title = None
+        # Try structured metadata first
+        og_title = soup.find('meta', property='og:title')
+        if og_title:
+            title = og_title.get('content', '').strip()
+        if not title:
+            h1 = soup.find('h1')
+            if h1:
+                title = h1.get_text(strip=True)
+        if not title:
+            page_title = soup.find('title')
+            if page_title:
+                raw = page_title.get_text(strip=True)
+                # Strip " | Snowflake" suffix
+                title = re.sub(r'\s*[|\-–]\s*Snowflake.*$', '', raw).strip()
+        if not title:
+            return None
 
-        Tries primary page-data URL first, then fallback (some new-style URLs
-        are served by the legacy Gatsby app). Returns dict with title, authors,
-        date, categories, content or None on failure.
-        """
-        page_data_urls = self._url_to_page_data_urls(url)
+        # --- Description ---
+        description = ''
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc:
+            description = og_desc.get('content', '').strip()
+        if not description:
+            meta_desc = soup.find('meta', attrs={'name': 'description'})
+            if meta_desc:
+                description = meta_desc.get('content', '').strip()
 
-        for page_data_url in page_data_urls:
-            result = self._fetch_article(page_data_url, retries)
-            if result:
-                return result
-
-        return None
-
-    def _fetch_article(self, page_data_url, retries):
-        """Fetch and parse a single page-data JSON URL."""
-        for attempt in range(retries):
+        # --- Published date ---
+        date = None
+        # Try JSON-LD schema
+        for script in soup.find_all('script', type='application/ld+json'):
             try:
-                response = self.session.get(page_data_url, timeout=30)
-
-                if response.status_code == 404:
-                    return None
-
-                response.raise_for_status()
-                data = response.json()
-
-                article = (data.get('result', {})
-                           .get('data', {})
-                           .get('drupal', {})
-                           .get('article', {}))
-
-                if not article:
-                    return None  # Empty article - try fallback URL
-
-                title = article.get('title')
-                if not title:
-                    return None
-
-                # Authors (as list of names)
-                authors = []
-                for author_entry in (article.get('fieldAuthors') or []):
-                    entity = (author_entry or {}).get('entity') or {}
-                    name = entity.get('name')
-                    if name:
-                        authors.append(name)
-
-                # Date
-                date = None
-                raw_date = article.get('entityCreatedRaw') or article.get('fieldDate')
+                data = json.loads(script.string or '')
+                if isinstance(data, list):
+                    data = data[0]
+                raw_date = data.get('datePublished') or data.get('dateCreated') or ''
                 if raw_date:
-                    match = re.match(r'(\d{4}-\d{2}-\d{2})', raw_date)
-                    if match:
-                        date = match.group(1)
+                    m = re.match(r'(\d{4}-\d{2}-\d{2})', raw_date)
+                    if m:
+                        date = m.group(1)
+                        break
+            except (json.JSONDecodeError, AttributeError):
+                continue
 
-                # Description (from metatags)
-                description = ''
-                for mt in (article.get('entityMetatags') or []):
-                    if isinstance(mt, dict) and mt.get('key') == 'description':
-                        description = mt.get('value', '')
+        # Try meta tags
+        if not date:
+            for attr_name in ['article:published_time', 'article:published', 'datePublished']:
+                tag = soup.find('meta', property=attr_name) or soup.find('meta', attrs={'name': attr_name})
+                if tag:
+                    raw = tag.get('content', '')
+                    m = re.match(r'(\d{4}-\d{2}-\d{2})', raw)
+                    if m:
+                        date = m.group(1)
                         break
 
-                # AI Summary
-                summary = ''
-                ai_summary = article.get('fieldAiSummary')
-                if isinstance(ai_summary, dict):
-                    summary_html = ai_summary.get('processed', '')
-                    if summary_html:
-                        summary = self._html_to_markdown(summary_html)
+        # Try time elements
+        if not date:
+            time_elem = soup.find('time')
+            if time_elem:
+                raw = time_elem.get('datetime', '') or time_elem.get_text()
+                m = re.match(r'(\d{4}-\d{2}-\d{2})', raw)
+                if m:
+                    date = m.group(1)
 
-                # Categories
-                categories = []
-                for cat_entry in (article.get('fieldCategories') or []):
-                    entity = (cat_entry or {}).get('entity') or {}
-                    name = entity.get('name')
-                    if name:
-                        categories.append(name)
-                for tag_entry in (article.get('fieldTags') or []):
-                    entity = (tag_entry or {}).get('entity') or {}
-                    name = entity.get('name')
-                    if name and name not in categories:
-                        categories.append(name)
-                categories_str = ', '.join(categories) if categories else None
+        # --- Authors ---
+        authors = []
+        # JSON-LD author
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string or '')
+                if isinstance(data, list):
+                    data = data[0]
+                author_data = data.get('author')
+                if author_data:
+                    if isinstance(author_data, dict):
+                        name = author_data.get('name', '')
+                        if name:
+                            authors.append(name)
+                    elif isinstance(author_data, list):
+                        for a in author_data:
+                            if isinstance(a, dict):
+                                name = a.get('name', '')
+                                if name:
+                                    authors.append(name)
+                    break
+            except (json.JSONDecodeError, AttributeError):
+                continue
 
-                # Body HTML -> Markdown
-                body = article.get('body', {})
-                body_html = body.get('processed', '') if isinstance(body, dict) else ''
-                if not body_html or len(body_html) < 50:
-                    return None
+        # Meta author fallback
+        if not authors:
+            meta_author = soup.find('meta', attrs={'name': 'author'})
+            if meta_author:
+                name = meta_author.get('content', '').strip()
+                if name:
+                    authors = [name]
 
-                content = self._html_to_markdown(body_html)
-                if not content or len(content) < 100:
-                    return None
+        # --- Categories / Tags ---
+        categories = []
+        # Try meta keywords
+        meta_kw = soup.find('meta', attrs={'name': 'keywords'})
+        if meta_kw:
+            kw_str = meta_kw.get('content', '')
+            categories = [k.strip() for k in kw_str.split(',') if k.strip()]
 
-                return {
-                    'title': title,
-                    'authors': authors,
-                    'date': date,
-                    'description': description,
-                    'summary': summary,
-                    'categories': categories_str,
-                    'content': content,
-                }
+        # Try article:tag meta
+        for tag_meta in soup.find_all('meta', property='article:tag'):
+            tag_name = tag_meta.get('content', '').strip()
+            if tag_name and tag_name not in categories:
+                categories.append(tag_name)
 
-            except requests.exceptions.RequestException as e:
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    return None
-            except (json.JSONDecodeError, KeyError, TypeError):
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    return None
+        categories_str = ', '.join(categories) if categories else None
 
-        return None
+        # --- Content ---
+        content = self._extract_content(soup)
+        if not content or len(content) < 100:
+            return None
+
+        return {
+            'title': title,
+            'authors': authors,
+            'date': date,
+            'description': description,
+            'categories': categories_str,
+            'content': content,
+        }
+
+    def _extract_content(self, soup):
+        """Extract main article content from HTML"""
+        # Remove unwanted elements first
+        for tag in soup.find_all(['script', 'style', 'nav', 'footer', 'header',
+                                   'iframe', 'noscript', 'aside']):
+            tag.decompose()
+
+        # Common selectors for article content (in priority order)
+        content_selectors = [
+            # Semantic HTML
+            ('tag', 'article'),
+            # Common class patterns
+            ('class_contains', 'article-content'),
+            ('class_contains', 'article-body'),
+            ('class_contains', 'post-content'),
+            ('class_contains', 'blog-content'),
+            ('class_contains', 'entry-content'),
+            ('class_contains', 'content-body'),
+            ('class_contains', 'blog-body'),
+            ('class_contains', 'rich-text'),
+            # Role attribute
+            ('role', 'main'),
+            # Fallback: main tag
+            ('tag', 'main'),
+        ]
+
+        article_elem = None
+        for selector_type, selector_value in content_selectors:
+            if selector_type == 'tag':
+                article_elem = soup.find(selector_value)
+            elif selector_type == 'class_contains':
+                article_elem = soup.find(class_=re.compile(selector_value, re.I))
+            elif selector_type == 'role':
+                article_elem = soup.find(attrs={'role': selector_value})
+
+            if article_elem:
+                # Verify it has meaningful content
+                text = article_elem.get_text(strip=True)
+                if len(text) >= 200:
+                    break
+                article_elem = None
+
+        if not article_elem:
+            # Last resort: body
+            article_elem = soup.find('body')
+
+        if not article_elem:
+            return None
+
+        return self._html_to_markdown(article_elem)
 
     # -------------------------------------------------------------------------
     # HTML to Markdown conversion
     # -------------------------------------------------------------------------
 
-    def _html_to_markdown(self, html):
-        """Convert body HTML string to markdown"""
-        soup = BeautifulSoup(html, 'html.parser')
+    def _html_to_markdown(self, elem):
+        """Convert HTML element tree to markdown"""
         lines = []
-        for child in soup.children:
+        for child in elem.children:
             if hasattr(child, 'name') and child.name:
                 self._process_element(child, lines)
             elif child.string and child.string.strip():
@@ -765,7 +729,7 @@ class DatabricksBlogScraper:
         return text.strip()
 
     def _process_element(self, elem, lines, depth=0):
-        """Recursively process HTML elements to markdown"""
+        """Recursively convert HTML elements to markdown"""
         if elem.name is None:
             text = elem.string
             if text and text.strip():
@@ -774,11 +738,14 @@ class DatabricksBlogScraper:
 
         tag = elem.name.lower() if elem.name else ''
 
-        skip_tags = {'script', 'style', 'nav', 'footer', 'header', 'iframe', 'noscript', 'svg'}
+        skip_tags = {'script', 'style', 'nav', 'footer', 'header', 'iframe',
+                     'noscript', 'svg', 'aside', 'form', 'button', 'input'}
         if tag in skip_tags:
             return
 
-        skip_classes = {'share', 'social', 'sidebar', 'related', 'comment', 'newsletter', 'cta', 'navigation'}
+        skip_classes = {'share', 'social', 'sidebar', 'related', 'comment',
+                        'newsletter', 'cta', 'navigation', 'subscribe', 'promo',
+                        'banner', 'popup', 'modal', 'cookie', 'ad', 'advertisement'}
         elem_classes = ' '.join(elem.get('class', [])).lower()
         if any(c in elem_classes for c in skip_classes):
             return
@@ -796,6 +763,7 @@ class DatabricksBlogScraper:
             if text.strip():
                 lines.append('')
                 lines.append(text)
+                lines.append('')
 
         elif tag == 'blockquote':
             text = elem.get_text(strip=True)
@@ -839,7 +807,7 @@ class DatabricksBlogScraper:
         elif tag == 'img':
             src = elem.get('src', '')
             alt = elem.get('alt', '')
-            if src:
+            if src and not src.startswith('data:'):
                 lines.append(f'![{alt}]({src})')
 
         elif tag == 'figure':
@@ -847,13 +815,13 @@ class DatabricksBlogScraper:
             if img:
                 src = img.get('src', '')
                 alt = img.get('alt', '')
-                if src:
+                if src and not src.startswith('data:'):
                     lines.append('')
                     lines.append(f'![{alt}]({src})')
-                caption = elem.find('figcaption')
-                if caption:
-                    lines.append(f'*{caption.get_text(strip=True)}*')
-                lines.append('')
+                    caption = elem.find('figcaption')
+                    if caption:
+                        lines.append(f'*{caption.get_text(strip=True)}*')
+                    lines.append('')
             else:
                 for child in elem.children:
                     if hasattr(child, 'name') and child.name:
@@ -869,7 +837,8 @@ class DatabricksBlogScraper:
             lines.append('---')
             lines.append('')
 
-        elif tag in ('div', 'section', 'article', 'main', 'span', 'a'):
+        elif tag in ('div', 'section', 'article', 'main', 'span', 'a',
+                     'li', 'td', 'th'):
             for child in elem.children:
                 if hasattr(child, 'name') and child.name:
                     self._process_element(child, lines, depth + 1)
@@ -914,7 +883,7 @@ class DatabricksBlogScraper:
             elif child.name == 'img':
                 src = child.get('src', '')
                 alt = child.get('alt', '')
-                if src:
+                if src and not src.startswith('data:'):
                     parts.append(f'![{alt}]({src})')
             else:
                 text = child.get_text()
@@ -946,17 +915,17 @@ class DatabricksBlogScraper:
 
 
 # =============================================================================
-# Blog Manager (Orchestrator)
+# Snowflake Manager (Orchestrator)
 # =============================================================================
 
-class BlogManager:
-    """Orchestrates blog scraping operations"""
+class SnowflakeManager:
+    """Orchestrates Snowflake blog scraping operations"""
 
     def __init__(self, config=None):
         self.config = config or Config()
         self.config.load()
-        self.db = BlogDatabase(self.config.database_path)
-        self.scraper = DatabricksBlogScraper()
+        self.db = SnowflakeDatabase(self.config.database_path)
+        self.scraper = SnowflakeScraper()
         self._shutdown = False
 
     def _setup_signal_handlers(self):
@@ -970,55 +939,32 @@ class BlogManager:
         signal.signal(signal.SIGINT, handler)
 
     def discover(self):
-        """Fetch sitemaps and add new blog + glossary URLs to database"""
-        # Discover blog posts
-        print("Fetching Databricks blog sitemap...")
-        blog_urls = self.scraper.fetch_sitemap_urls()
+        """Fetch sitemaps and add new post URLs to database"""
+        print("Fetching Snowflake blog sitemap...")
+        urls = self.scraper.fetch_sitemap_urls()
 
-        blog_new = 0
+        new_count = 0
         with self.db:
-            if blog_urls:
-                print(f"Found {len(blog_urls)} blog URLs in sitemap")
-                for entry in blog_urls:
-                    added = self.db.add_post(entry['slug'], entry['url'], content_type='blog')
+            if urls:
+                print(f"Found {len(urls)} blog URLs in sitemap")
+                for entry in urls:
+                    added = self.db.add_post(entry['slug'], entry['url'])
                     if added:
-                        blog_new += 1
+                        new_count += 1
             else:
                 print("No blog URLs found in sitemap.")
 
-        print(f"New blog posts added: {blog_new}")
+        print(f"New posts added: {new_count}")
 
-        # Discover glossary pages
-        print()
-        print("Fetching Databricks glossary sitemap...")
-        glossary_urls = self.scraper.fetch_glossary_urls()
-
-        glossary_new = 0
         with self.db:
-            if glossary_urls:
-                print(f"Found {len(glossary_urls)} glossary URLs in sitemap")
-                for entry in glossary_urls:
-                    added = self.db.add_post(entry['slug'], entry['url'], content_type='glossary')
-                    if added:
-                        glossary_new += 1
-            else:
-                print("No glossary URLs found in sitemap.")
-
-        print(f"New glossary pages added: {glossary_new}")
-
-        # Summary
-        print()
-        with self.db:
-            blog_counts = self.db.get_counts(content_type='blog')
-            glossary_counts = self.db.get_counts(content_type='glossary')
-            total_counts = self.db.get_counts()
-
-        print(f"Total in database: {total_counts.get('total', 0)}")
-        print(f"  Blog:     {blog_counts.get('total', 0)} (pending: {blog_counts.get('pending', 0)})")
-        print(f"  Glossary: {glossary_counts.get('total', 0)} (pending: {glossary_counts.get('pending', 0)})")
+            counts = self.db.get_counts()
+        print(f"Total in database: {counts.get('total', 0)}")
+        print(f"  Pending:    {counts.get('pending', 0)}")
+        print(f"  Downloaded: {counts.get('downloaded', 0)}")
+        print(f"  Failed:     {counts.get('failed', 0)}")
 
     def scrape(self, slug=None, limit=None, parallel=False):
-        """Download blog posts via Gatsby page-data JSON"""
+        """Download blog posts"""
         self._setup_signal_handlers()
 
         with self.db:
@@ -1041,16 +987,9 @@ class BlogManager:
         else:
             self._scrape_sequential(posts)
 
-    def _scrape_one(self, post):
-        """Fetch a single post/glossary page based on content_type."""
-        content_type = post.get('content_type', 'blog')
-        if content_type == 'glossary':
-            return self.scraper.scrape_glossary(post['slug'], retries=self.config.max_retries)
-        return self.scraper.scrape_post(post['url'], retries=self.config.max_retries)
-
     def _scrape_sequential(self, posts):
         """Download posts one at a time"""
-        print(f"Scraping {len(posts)} blog posts (sequential)")
+        print(f"Scraping {len(posts)} posts (sequential)")
         print(f"Delay between requests: {self.config.delay}s")
         print()
 
@@ -1064,16 +1003,14 @@ class BlogManager:
 
             print(f"[{i+1}/{len(posts)}] {post['slug']}...", end=" ", flush=True)
 
-            result = self._scrape_one(post)
+            result = self.scraper.scrape_post(post['url'], retries=self.config.max_retries)
 
             if result and result['content'] and len(result['content']) >= 100:
-                ct = post.get('content_type', 'blog')
-                filepath = self._save_post(post['slug'], post['url'], result, content_type=ct)
-
+                filepath = self._save_post(post['slug'], post['url'], result)
                 word_count = len(result['content'].split())
                 char_count = len(result['content'])
-
                 author_str = ', '.join(result['authors']) if result['authors'] else None
+
                 with self.db:
                     self.db.update_post(
                         post['slug'],
@@ -1099,7 +1036,6 @@ class BlogManager:
             if i < len(posts) - 1 and not self._shutdown:
                 time.sleep(self.config.delay)
 
-        # Log sync
         with self.db:
             status = 'success' if failed == 0 else 'partial'
             self.db.add_sync_log(0, 0, successful, failed, status)
@@ -1107,16 +1043,11 @@ class BlogManager:
         print(f"\nComplete: {successful} downloaded, {failed} failed")
 
     def _scrape_parallel(self, posts):
-        """Download posts in parallel using ThreadPoolExecutor.
-
-        HTTP fetching and file saving run in parallel threads.
-        DB writes are serialized on the main thread to avoid DuckDB
-        concurrency issues.
-        """
+        """Download posts in parallel using ThreadPoolExecutor"""
         max_workers = self.config.max_workers
         delay = self.config.delay
 
-        print(f"Scraping {len(posts)} blog posts (parallel, {max_workers} workers)")
+        print(f"Scraping {len(posts)} posts (parallel, {max_workers} workers)")
         print(f"Delay between requests: {delay}s per worker")
         print()
 
@@ -1127,21 +1058,19 @@ class BlogManager:
         completed = 0
 
         def _fetch_post(post):
-            """Fetch and save post content (no DB writes)."""
             nonlocal completed
 
             if self._shutdown:
                 return None
 
-            result = self._scrape_one(post)
+            result = self.scraper.scrape_post(post['url'], retries=self.config.max_retries)
 
             with counter_lock:
                 completed += 1
                 idx = completed
 
             if result and result['content'] and len(result['content']) >= 100:
-                ct = post.get('content_type', 'blog')
-                filepath = self._save_post(post['slug'], post['url'], result, content_type=ct)
+                filepath = self._save_post(post['slug'], post['url'], result)
                 word_count = len(result['content'].split())
                 char_count = len(result['content'])
 
@@ -1160,12 +1089,8 @@ class BlogManager:
             else:
                 with progress_lock:
                     print(f"[{idx}/{len(posts)}] {post['slug']}... FAILED (no content)")
-
                 time.sleep(delay)
-                return {
-                    'slug': post['slug'],
-                    'success': False,
-                }
+                return {'slug': post['slug'], 'success': False}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
@@ -1206,47 +1131,31 @@ class BlogManager:
                         self.db.update_post(outcome['slug'], status='failed')
                     failed += 1
 
-        # Log sync
         with self.db:
             status = 'success' if failed == 0 else 'partial'
             self.db.add_sync_log(0, 0, successful, failed, status)
 
         print(f"\nComplete: {successful} downloaded, {failed} failed")
 
-    def _save_post(self, slug, url, result, content_type='blog'):
-        """Save a blog post or glossary page as Obsidian markdown matching clipping format.
-
-        Format matches existing Obsidian clippings with:
-        - Title-based filename
-        - Authors as wikilinks in YAML list
-        - published/created date fields
-        - description from meta tags
-        - #### Summary section with AI-generated bullet points
-        """
-        subfolder = 'Databricks Glossary' if content_type == 'glossary' else 'Databricks'
-        output_dir = Path(self.config.staging_dir) / subfolder
+    def _save_post(self, slug, url, result):
+        """Save a blog post as Obsidian markdown in clipping format"""
+        output_dir = Path(self.config.staging_dir) / 'Snowflake'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Filename based on title (sanitized)
         title = result['title'] or slug
         safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
         safe_title = re.sub(r'\s+', ' ', safe_title).strip()
         filepath = output_dir / f"{safe_title}.md"
 
-        # Escape quotes in title for YAML
         yaml_title = title.replace('"', '\\"')
-
-        date = result['date'] or ''
+        date = result.get('date') or ''
         today = datetime.now().strftime('%Y-%m-%d')
         description = (result.get('description') or '').replace('"', '\\"')
 
-        # Build frontmatter
-        fm = []
-        fm.append('---')
+        fm = ['---']
         fm.append(f'title: "{yaml_title}"')
         fm.append(f'source: "{url}"')
 
-        # Authors as wikilinks
         if result['authors']:
             fm.append('author:')
             for name in result['authors']:
@@ -1259,25 +1168,10 @@ class BlogManager:
             fm.append(f'description: "{description}"')
         fm.append('tags:')
         fm.append('  - "clippings"')
-        fm.append('  - "databricks"')
-        if content_type == 'glossary':
-            fm.append('  - "glossary"')
+        fm.append('  - "snowflake"')
         fm.append('---')
 
-        # Build body
-        body_parts = ['\n'.join(fm)]
-
-        # Summary section
-        summary = result.get('summary', '')
-        if summary:
-            body_parts.append('#### Summary')
-            body_parts.append('')
-            body_parts.append(summary)
-
-        # Main content
-        body_parts.append('')
-        body_parts.append(result['content'])
-        body_parts.append('')
+        body_parts = ['\n'.join(fm), '', result['content'], '']
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write('\n'.join(body_parts))
@@ -1310,15 +1204,13 @@ class BlogManager:
         """Show summary statistics"""
         with self.db:
             counts = self.db.get_counts()
-            blog_counts = self.db.get_counts(content_type='blog')
-            glossary_counts = self.db.get_counts(content_type='glossary')
 
         total = counts.get('total', 0)
         pending = counts.get('pending', 0)
         downloaded = counts.get('downloaded', 0)
         failed = counts.get('failed', 0)
 
-        print(f"\nDatabricks Blog Scraper Status")
+        print(f"\nSnowflake Blog Scraper Status")
         print(f"{'='*40}")
         print(f"Total:          {total}")
         print(f"  Pending:      {pending}")
@@ -1328,19 +1220,6 @@ class BlogManager:
         if total > 0:
             pct = (downloaded / total) * 100
             print(f"\nProgress: {pct:.1f}%")
-
-        # Per-type breakdown
-        bt = blog_counts.get('total', 0)
-        gt = glossary_counts.get('total', 0)
-        if bt or gt:
-            print(f"\nBy type:")
-            if bt:
-                print(f"  Blog:     {bt} total, {blog_counts.get('downloaded', 0)} downloaded, "
-                      f"{blog_counts.get('pending', 0)} pending, {blog_counts.get('failed', 0)} failed")
-            if gt:
-                print(f"  Glossary: {gt} total, {glossary_counts.get('downloaded', 0)} downloaded, "
-                      f"{glossary_counts.get('pending', 0)} pending, {glossary_counts.get('failed', 0)} failed")
-
         print()
 
     def move_to_obsidian(self, all_posts=False):
@@ -1348,7 +1227,7 @@ class BlogManager:
         obsidian_path = self.config.obsidian_vault
         if not obsidian_path:
             print("Error: Obsidian vault path not configured")
-            print("Run: scrape_blogs.py config set obsidian_vault /path/to/vault")
+            print("Run: scrape_snowflake.py config set obsidian_vault /path/to/vault")
             return
 
         obsidian_path = Path(obsidian_path).expanduser()
@@ -1364,32 +1243,19 @@ class BlogManager:
             return
 
         moved_slugs = []
-        blog_count = 0
-        glossary_count = 0
         for post in posts:
             src_file = Path(post['file_path'])
             if src_file.exists():
-                ct = post.get('content_type', 'blog')
-                subfolder = 'Databricks Glossary' if ct == 'glossary' else 'Databricks'
-                dst_dir = obsidian_path / subfolder
+                dst_dir = obsidian_path / 'Snowflake'
                 dst_dir.mkdir(parents=True, exist_ok=True)
                 dst_file = dst_dir / src_file.name
                 shutil.copy2(src_file, dst_file)
                 moved_slugs.append(post['slug'])
-                if ct == 'glossary':
-                    glossary_count += 1
-                else:
-                    blog_count += 1
 
         with self.db:
             self.db.mark_moved(moved_slugs)
 
-        parts = []
-        if blog_count:
-            parts.append(f"{blog_count} blog posts")
-        if glossary_count:
-            parts.append(f"{glossary_count} glossary pages")
-        print(f"Moved {' + '.join(parts) if parts else '0 posts'} to: {obsidian_path}")
+        print(f"Moved {len(moved_slugs)} posts to: {obsidian_path}")
 
     def retry_failed(self):
         """Reset failed posts to pending"""
@@ -1407,6 +1273,7 @@ class BlogManager:
         print(f"database:      {self.config.database_path}")
         print(f"delay:         {self.config.delay}")
         print(f"max_retries:   {self.config.max_retries}")
+        print(f"max_workers:   {self.config.max_workers}")
 
     def set_config(self, key, value):
         """Set a configuration value"""
@@ -1422,7 +1289,7 @@ class BlogManager:
                 pass
 
         self.config.set(key, value)
-        print(f"Set blogs.{key} = {value}")
+        print(f"Set snowflake.{key} = {value}")
 
 
 # =============================================================================
@@ -1431,7 +1298,7 @@ class BlogManager:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Databricks Blog Scraper - Download blog posts as Obsidian markdown',
+        description='Snowflake Blog Scraper - Download blog posts as Obsidian markdown',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1441,8 +1308,11 @@ Examples:
   # Download all pending posts
   %(prog)s scrape
 
+  # Download in parallel
+  %(prog)s scrape --parallel
+
   # Download a single post
-  %(prog)s scrape --slug "delta-lake-explained"
+  %(prog)s scrape --slug "introducing-snowpark"
 
   # Download first 50 pending posts
   %(prog)s scrape --limit 50
@@ -1492,38 +1362,45 @@ Examples:
 
     # Move
     move_parser = subparsers.add_parser('move', help='Move downloaded posts to Obsidian vault')
-    move_parser.add_argument('--all', action='store_true', required=True,
-                             help='Move all downloaded posts')
+    move_parser.add_argument('--all', action='store_true', help='Move all downloaded posts')
 
     # Retry
     subparsers.add_parser('retry', help='Reset failed posts to pending')
 
     # Config
     config_parser = subparsers.add_parser('config', help='View/set configuration')
-    config_parser.add_argument('action', choices=['show', 'set'], help='Action')
-    config_parser.add_argument('key', nargs='?', help='Config key')
-    config_parser.add_argument('value', nargs='?', help='Value to set')
+    config_subparsers = config_parser.add_subparsers(dest='config_command')
+    config_subparsers.add_parser('show', help='Show current config')
+    config_set_parser = config_subparsers.add_parser('set', help='Set a config value')
+    config_set_parser.add_argument('key', help='Config key')
+    config_set_parser.add_argument('value', help='Config value')
 
     args = parser.parse_args()
 
-    config = Config()
-    config.load()
-    manager = BlogManager(config)
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    manager = SnowflakeManager()
 
     if args.command == 'discover':
         manager.discover()
 
     elif args.command == 'scrape':
-        parallel = args.parallel or bool(args.workers)
-        if args.sequential:
-            parallel = False
+        parallel = args.parallel or (args.workers is not None)
         if args.workers:
-            config.set('max_workers', args.workers)
-            config.load()
-        manager.scrape(slug=args.slug, limit=args.limit, parallel=parallel)
+            manager.config.set('max_workers', args.workers)
+        manager.scrape(
+            slug=args.slug,
+            limit=args.limit,
+            parallel=parallel,
+        )
 
     elif args.command == 'list':
-        manager.list_posts(status=args.status, json_output=args.json)
+        manager.list_posts(
+            status=args.status,
+            json_output=args.json,
+        )
 
     elif args.command == 'status':
         manager.show_status()
@@ -1535,17 +1412,16 @@ Examples:
         manager.retry_failed()
 
     elif args.command == 'config':
-        if args.action == 'show':
+        if args.config_command == 'show':
             manager.show_config()
-        elif args.action == 'set':
-            if not args.key or args.value is None:
-                print("Usage: config set <key> <value>")
-                print("Example: config set obsidian_vault /path/to/vault")
-                return
+        elif args.config_command == 'set':
             manager.set_config(args.key, args.value)
+        else:
+            config_parser.print_help()
 
     else:
         parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == '__main__':

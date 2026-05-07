@@ -99,6 +99,65 @@ medium_domains = []
 ollama_url = ""
 ollama_model = ""
 
+[docs]
+# Staging folder for documentation downloads (before moving to Obsidian)
+staging_dir = "docs_obsidian"
+
+# Obsidian vault docs path (machine-specific - set in config.local.toml)
+obsidian_vault = ""
+
+# Database location (separate from other scrapers)
+database = "docs.db"
+
+# Delay between requests (seconds)
+delay = 1.0
+
+# Retry attempts for failed pages
+max_retries = 3
+
+# Parallel workers (used with --parallel flag)
+max_workers = 4
+
+# AWS service paths to discover (empty = ALL services, which is 100k+ pages)
+# Set in config.local.toml to specific paths you want, e.g.:
+# aws_paths = ["AmazonS3/latest/userguide", "lambda/latest/dg", "AmazonRDS/latest/UserGuide"]
+aws_paths = []
+
+# Databricks docs paths to scrape. Defaults to AWS English only.
+# Add "gcp/en" or "aws/ja" etc. to include other cloud/language combos.
+databricks_paths = ["aws/en"]
+
+[snowflake]
+# Staging folder for Snowflake blog downloads (before moving to Obsidian)
+staging_dir = "snowflake_obsidian"
+
+# Obsidian vault blogs path (machine-specific - set in config.local.toml)
+obsidian_vault = ""
+
+# Database location (separate from other scrapers)
+database = "snowflake.db"
+
+# Delay between requests (seconds)
+delay = 1.5
+
+# Retry attempts for failed posts
+max_retries = 3
+
+# Parallel workers (used with --parallel flag)
+max_workers = 4
+
+[sync]
+# Enable/disable each pipeline in sync_all.sh
+novels   = true
+blogs    = true
+medium   = true
+raindrop = true
+docs     = true
+snowflake = false
+
+# Which doc sites to include (supported: snowflake, soda, aws, databricks, claude-code)
+doc_sites = ["databricks", "claude-code"]
+
 [notifications]
 # Enable notifications on new chapters
 enabled = false

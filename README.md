@@ -1,210 +1,304 @@
-# Novel Web Scraper
+# Web Scraper Suite
 
-A Python-based web scraper for downloading novels from various sources and converting them to Obsidian-compatible markdown format.
+Six scrapers that pull content from various sources, track state in DuckDB, and sync files to an Obsidian vault. All commands run via `uv run python <script> <command>`.
 
-## Features
+## Scrapers
 
-- Scrapes novels from **freewebnovel.com** (primary, no Cloudflare)
-- Scrapes novels from **novelbin.com** (requires cloudscraper for Cloudflare bypass)
-- Outputs **Obsidian-compatible** markdown with YAML frontmatter and tags
-- Creates **index files** with wikilinks to all chapters
-- **CLI interface** with URL parameters
-- Automatic retry on failures
-- Progress tracking and error reporting
+| Script | Source | Obsidian folder | Tags |
+|--------|--------|-----------------|------|
+| `scrape_novels.py` | Web novels (3 sites) | Novels vault | `book/novel` |
+| `scrape_blogs.py` | Databricks blog + glossary | Clippings vault | `clippings`, `databricks` |
+| `scrape_medium.py` | Medium RSS by username | Clippings vault | `clippings`, `medium` |
+| `scrape_raindrop.py` | Raindrop.io bookmarks | Clippings vault | `clippings`, `raindrop` |
+| `scrape_snowflake.py` | Snowflake blog | Clippings vault | `clippings`, `snowflake` |
+| `scrape_docs.py` | Docs sites (Databricks, Claude Code, Snowflake, Soda, AWS) | Docs vault | `clippings`, `documentation` |
+
+---
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.11+
 - [uv](https://github.com/astral-sh/uv) package manager
 
-## Installation
-
 ```bash
-# Clone or navigate to the project directory
-cd novel-web-scrapper
-
-# Install dependencies using uv
 uv sync
 ```
 
-## Quick Start
+---
 
-### Command Line Interface (Recommended)
+## Configuration
+
+All settings live in `config.toml`. Machine-specific overrides (vault paths, API tokens) go in `config.local.toml`, which is gitignored.
+
+### Set vault paths
 
 ```bash
-# Basic usage
-uv run python scrape_novels.py --url URL --name "Novel Name" --end CHAPTERS
-
-# Example: Scrape a novel from freewebnovel.com
-uv run python scrape_novels.py \
-  --url "https://freewebnovel.com/my-vampire-system.html" \
-  --name "My Vampire System" \
-  --end 2545
-
-# With all options
-uv run python scrape_novels.py \
-  --url "https://freewebnovel.com/rezero-kara-hajimeru-isekai-seikatsu-wn.html" \
-  --name "Re Zero WN" \
-  --start 1 \
-  --end 549 \
-  --output novels_obsidian \
-  --delay 1.5
+uv run python scrape_novels.py    config set obsidian_vault "/path/to/vault/Novels"
+uv run python scrape_blogs.py     config set obsidian_vault "/path/to/vault/Clippings"
+uv run python scrape_medium.py    config set obsidian_vault "/path/to/vault/Clippings"
+uv run python scrape_raindrop.py  config set obsidian_vault "/path/to/vault/Clippings"
+uv run python scrape_snowflake.py config set obsidian_vault "/path/to/vault/Clippings"
+uv run python scrape_docs.py      config set obsidian_vault "/path/to/vault/Docs"
 ```
 
-### CLI Options
+### Set API tokens
 
-| Option | Short | Required | Default | Description |
-|--------|-------|----------|---------|-------------|
-| `--url` | `-u` | Yes | - | Novel URL from freewebnovel.com |
-| `--name` | `-n` | Yes | - | Novel name (used for folder and tags) |
-| `--end` | `-e` | Yes | - | Last chapter number to scrape |
-| `--start` | `-s` | No | 1 | First chapter number to scrape |
-| `--output` | `-o` | No | novels_obsidian | Output directory |
-| `--delay` | `-d` | No | 1.5 | Delay between requests (seconds) |
+```bash
+# Raindrop — create test token at https://app.raindrop.io/settings/integrations
+uv run python scrape_raindrop.py config set test_token "TOKEN"
 
-### Python API
-
-```python
-from scrape_novels import FreeWebNovelScraper
-
-scraper = FreeWebNovelScraper(output_dir="novels_obsidian")
-scraper.scrape_range(
-    novel_slug="my-vampire-system",
-    novel_name="My Vampire System",
-    start_chapter=1,
-    end_chapter=2545,
-    delay=1.5
-)
+# Medium (for member-only posts) — copy sid/uid from browser cookies
+uv run python scrape_medium.py config set sid "SID"
+uv run python scrape_medium.py config set uid "UID"
 ```
-
-### For novelbin.com (Cloudflare protected)
-
-```python
-from scrape_novels import NovelBinScraper
-
-scraper = NovelBinScraper(output_dir="novels_obsidian")
-
-# Simple URL format (/chapter-1, /chapter-2)
-scraper.scrape_range(
-    novel_slug="my-werewolf-system-novel",
-    novel_name="My Werewolf System",
-    start_chapter=1,
-    end_chapter=325,
-    delay=2
-)
-
-# Title-based URLs (/chapter-1-the-beginning)
-scraper.scrape_with_chapter_list(
-    novel_slug="shadow-slave",
-    novel_name="Shadow Slave",
-    start_chapter=1,
-    delay=2
-)
-```
-
-## Supported Sites
-
-| Site | Cloudflare | Scraper Class | Notes |
-|------|------------|---------------|-------|
-| freewebnovel.com | No | `FreeWebNovelScraper` | Recommended, faster |
-| novelbin.com | Yes | `NovelBinScraper` | May get blocked |
-
-## Output Structure
-
-```
-novels_obsidian/
-├── My Vampire System/
-│   ├── 0001 - My Vampire System.md
-│   ├── 0002 - My Vampire System.md
-│   ├── ...
-│   └── My_Vampire_System_Index.md
-├── Re Zero WN/
-│   ├── 0001 - Re Zero Wn.md
-│   ├── ...
-│   └── Re_Zero_Wn_Index.md
-└── ...
-```
-
-## Chapter File Format
-
-Each chapter file follows the Obsidian format:
-
-```markdown
----
-tags:
-  - book/novel
-  - my-vampire-system
----
-
-# My Vampire System
-
-**Novel:** My Vampire System
-
-**Chapter:** 1
 
 ---
 
-[Chapter content here...]
+## Controlling which pipelines run
+
+The `[sync]` section in `config.toml` (or `config.local.toml`) controls what `sync_all.sh` runs:
+
+```toml
+[sync]
+novels    = true
+blogs     = true
+medium    = true
+raindrop  = true
+docs      = true
+snowflake = false
+
+# Which doc sites to include (options: snowflake, soda, aws, databricks, claude-code)
+doc_sites = ["databricks", "claude-code"]
 ```
 
-## Index File Format
+Set any pipeline to `false` to skip it. Add or remove entries from `doc_sites` to control which documentation sources are scraped.
 
-The index file contains a Table of Contents with Obsidian wikilinks:
-
-```markdown
----
-tags:
-  - book/novel
-  - my-vampire-system
 ---
 
-# My Vampire System
+## Novels (`scrape_novels.py`)
 
-## Table of Contents
----
+Supports **freewebnovel.com**, **novelbin.com**, and **lightnovelstranslations.com**.
 
-- [Chapter 1](#chapter-1) -> [[0001_-_My_Vampire_System]]
-- [Chapter 2](#chapter-2) -> [[0002_-_My_Vampire_System]]
-...
+```bash
+# Add a novel
+uv run python scrape_novels.py add --url "https://freewebnovel.com/my-vampire-system.html" --name "My Vampire System"
+
+# Check for new chapters
+uv run python scrape_novels.py check
+
+# Download + sync new chapters to Obsidian
+uv run python scrape_novels.py sync --all
+uv run python scrape_novels.py move --all
+
+# List tracked novels
+uv run python scrape_novels.py list
+
+# Import novels already in Obsidian
+uv run python scrape_novels.py scan-obsidian
 ```
 
-## Finding Novel URLs
+---
 
-### freewebnovel.com
-1. Search for the novel on the site
-2. Copy the URL: `https://freewebnovel.com/novel-name.html`
-3. Check the last chapter number on the novel page
+## Databricks Blog (`scrape_blogs.py`)
 
-### novelbin.com
-1. Navigate to the novel page
-2. Copy the slug from URL: `novelbin.com/b/novel-slug`
+```bash
+uv run python scrape_blogs.py discover          # find new posts
+uv run python scrape_blogs.py scrape --parallel # download
+uv run python scrape_blogs.py move --all        # copy to Obsidian
+uv run python scrape_blogs.py status
+uv run python scrape_blogs.py retry             # reset failed → pending
+```
+
+---
+
+## Medium (`scrape_medium.py`)
+
+```bash
+uv run python scrape_medium.py add-user USERNAME
+uv run python scrape_medium.py discover
+uv run python scrape_medium.py scrape --parallel
+uv run python scrape_medium.py move --all
+uv run python scrape_medium.py status
+```
+
+---
+
+## Raindrop (`scrape_raindrop.py`)
+
+Medium URLs are automatically routed to `medium.db`. YouTube URLs are saved as transcripts under a `YouTube/` subfolder.
+
+```bash
+uv run python scrape_raindrop.py discover
+uv run python scrape_raindrop.py scrape --parallel
+uv run python scrape_raindrop.py move --all
+uv run python scrape_raindrop.py status
+uv run python scrape_raindrop.py fix            # diagnose failures
+uv run python scrape_raindrop.py retry
+```
+
+---
+
+## Snowflake Blog (`scrape_snowflake.py`)
+
+```bash
+uv run python scrape_snowflake.py discover
+uv run python scrape_snowflake.py scrape --parallel
+uv run python scrape_snowflake.py move --all
+uv run python scrape_snowflake.py status
+```
+
+---
+
+## Docs (`scrape_docs.py`)
+
+Supported sites: `snowflake`, `soda`, `aws`, `databricks`, `claude-code`.
+
+> **Warning:** `aws` without specific paths will discover 100k+ pages. Always set `aws_paths` in config first.
+
+```bash
+uv run python scrape_docs.py discover [--site KEY]
+uv run python scrape_docs.py scrape --parallel [--site KEY]
+uv run python scrape_docs.py move --all [--site KEY]
+uv run python scrape_docs.py status [--site KEY]
+
+# Limit AWS to specific services
+uv run python scrape_docs.py config set aws_paths '["AmazonS3/latest/userguide"]'
+```
+
+---
+
+## Daily Sync (`sync_all.sh`)
+
+Runs all enabled pipelines in parallel. Novels are skipped if no new chapters are found.
+
+```bash
+./sync_all.sh
+```
+
+Output:
+
+```
+Scraper Pipeline  2026-05-07 03:00:00
+
+  ✓  Novels       synced              42s
+  ✓  Blogs        done                18s
+  ✓  Medium       done                12s
+  ✓  Raindrop     done                31s
+  ✓  Docs         done               180s
+
+Done in 184s — logged to sync.log
+```
+
+### Logs
+
+| File | Contents |
+|------|----------|
+| `sync.log` | Timestamped summary + full pipeline output |
+| `sync_launchd.log` | stdout/stderr from scheduled runs |
+
+### Discord notifications (optional)
+
+Create `.env.local` in the project directory:
+
+```bash
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+```
+
+---
+
+## Scheduling on macOS (launchd)
+
+A launchd plist is included that runs `sync_all.sh` daily at **2:00 AM**.
+
+### Load (enable)
+
+```bash
+cp com.scraper.sync.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.scraper.sync.plist
+```
+
+### Verify it is scheduled
+
+```bash
+launchctl list | grep com.scraper.sync
+```
+
+### Run immediately (without waiting for 3AM)
+
+```bash
+launchctl start com.scraper.sync
+```
+
+### Unload (disable)
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.scraper.sync.plist
+```
+
+### Change the schedule
+
+Edit `com.scraper.sync.plist` and update `StartCalendarInterval`:
+
+```xml
+<key>StartCalendarInterval</key>
+<dict>
+    <key>Hour</key>
+    <integer>2</integer>    <!-- 0–23 -->
+    <key>Minute</key>
+    <integer>0</integer>
+</dict>
+```
+
+Then reload:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.scraper.sync.plist
+cp com.scraper.sync.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.scraper.sync.plist
+```
+
+> **Note:** launchd only runs when your Mac is awake. If the Mac is asleep at 3AM, the job is skipped until the next day. For reliable scheduling, consider keeping the Mac awake overnight or adjusting the time.
+
+---
+
+## Troubleshooting
+
+```bash
+# Check pipeline status
+uv run python scrape_novels.py list
+uv run python scrape_blogs.py status
+uv run python scrape_raindrop.py status
+uv run python scrape_docs.py status
+
+# Retry failed items
+uv run python scrape_<name>.py retry
+
+# Medium cookies expired — refresh from browser (F12 → Application → Cookies → medium.com)
+uv run python scrape_medium.py config set sid "NEW_SID"
+uv run python scrape_medium.py config set uid "NEW_UID"
+
+# Diagnose Raindrop failures
+uv run python scrape_raindrop.py fix --json
+```
+
+---
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `scrape_novels.py` | Main scraper with CLI and scraper classes |
-| `main.py` | Interactive scraper for freewebnovel.com with offset detection |
-| `convert_to_obsidian.py` | Convert existing folders to Obsidian format |
-| `test_scrape.py` | Test script for verifying scraper works |
+| `scrape_novels.py` | Novel scraper (3 sites) |
+| `scrape_blogs.py` | Databricks blog scraper |
+| `scrape_medium.py` | Medium RSS scraper |
+| `scrape_raindrop.py` | Raindrop.io bookmark scraper |
+| `scrape_snowflake.py` | Snowflake blog scraper |
+| `scrape_docs.py` | Multi-site documentation scraper |
+| `sync_all.sh` | Parallel daily sync pipeline |
+| `com.scraper.sync.plist` | macOS launchd schedule (3AM daily) |
+| `config.toml` | Default configuration (committed) |
+| `config.local.toml` | Machine-specific overrides (gitignored) |
+| `novels.db` | Novel tracking database (committed) |
 
-## Troubleshooting
-
-### 403 Forbidden Errors
-- **freewebnovel.com**: Usually works without issues
-- **novelbin.com**: Uses Cloudflare protection, may get blocked
-  - Try increasing delay between requests
-  - Site may have updated protection
-
-### Empty Content
-- The chapter may not exist on the site
-- Check if you're using the correct URL format
-- Some chapters may be premium/locked
-
-### Missing Chapters
-- Some novels have gaps in chapter numbers
-- The site may not have all chapters available
-
-## License
+---
 
 For personal use only. Respect the original content creators and website terms of service.

@@ -669,6 +669,39 @@ class RaindropScraper:
         }
 
     # -------------------------------------------------------------------------
+    # Firebase Dynamic Link resolution
+    # -------------------------------------------------------------------------
+
+    FIREBASE_DYNAMIC_LINK_DOMAINS = {'search.app', 'share.google'}
+
+    def _resolve_firebase_dynamic_link(self, url):
+        """Resolve a Firebase Dynamic Link (search.app, share.google) to its destination URL.
+
+        Firebase serves a 302 redirect when the request looks like curl (no browser
+        fingerprinting headers). Using urllib.request with a curl User-Agent reliably
+        follows the redirect chain to the real article URL.
+
+        Returns the resolved destination URL, or the original URL on failure.
+        """
+        import urllib.request as _urllib_request
+        try:
+            parsed = urlparse(url)
+            if parsed.hostname not in self.FIREBASE_DYNAMIC_LINK_DOMAINS:
+                return url
+
+            req = _urllib_request.Request(url, headers={'User-Agent': 'curl/7.88.1'})
+            resp = _urllib_request.urlopen(req, timeout=20)
+            final_url = resp.url
+
+            parsed_final = urlparse(final_url)
+            if parsed_final.hostname and parsed_final.hostname not in self.FIREBASE_DYNAMIC_LINK_DOMAINS:
+                return final_url
+
+            return url
+        except Exception:
+            return url
+
+    # -------------------------------------------------------------------------
     # Page scraping
     # -------------------------------------------------------------------------
 
@@ -678,6 +711,11 @@ class RaindropScraper:
         Returns dict on success: {title, author, date, description, content}
         Returns error dict on failure: {error: True, reason, detail, html}
         """
+        # Resolve Firebase Dynamic Links (search.app, share.google) before scraping
+        resolved_url = self._resolve_firebase_dynamic_link(url)
+        if resolved_url != url:
+            return self.fetch_page_content(resolved_url, retries=retries)
+
         last_error = None
         raw_html = ''
 

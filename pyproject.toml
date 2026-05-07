@@ -9,6 +9,7 @@ dependencies = [
     "cloudscraper>=1.2.71",
     "duckdb>=1.0.0",
     "lxml>=5.0.0",
+    "playwright>=1.58.0",
     "requests>=2.32.4",
     "selenium>=4.33.0",
     "webdriver-manager>=4.0.2",

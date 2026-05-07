@@ -1521,6 +1521,119 @@ class MediumManager:
             count = self.db.reset_failed()
         print(f"Reset failed posts. Pending count: {count}")
 
+    # -------------------------------------------------------------------------
+    # Series linking
+    # -------------------------------------------------------------------------
+
+    ROMAN = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
+             'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10}
+
+    _SERIES_PATTERNS = [
+        # "… Part I of II", "… Part II of III"  (separator optional)
+        re.compile(r'^(.*?)\s*[:\-\u2014\u2013]?\s*Part\s+(I{1,3}V?|VI{0,3}|IX|X)\s+of\s+\w+\s*$', re.IGNORECASE),
+        # "… Part I", "… Part II"  (no total)
+        re.compile(r'^(.*?)\s*[:\-\u2014\u2013]\s*Part\s+(I{1,3}V?|VI{0,3}|IX|X)\s*$', re.IGNORECASE),
+        # "… Part 1 of 3", "… Part 2"  (arabic)
+        re.compile(r'^(.*?)\s*[:\-\u2014\u2013]\s*Part\s+(\d+)(?:\s+of\s+\d+)?\s*$', re.IGNORECASE),
+        # "(Part I)" or "(Part 1)" at end
+        re.compile(r'^(.*?)\s*\(Part\s+(I{1,3}V?|VI{0,3}|IX|X|\d+)\)\s*$', re.IGNORECASE),
+    ]
+
+    def _detect_series(self, title):
+        """Return (base_title, part_num) if title is part of a multi-part series, else None."""
+        for pattern in self._SERIES_PATTERNS:
+            m = pattern.match(title.strip())
+            if m:
+                base, part_str = m.group(1).strip(), m.group(2).upper()
+                if part_str in self.ROMAN:
+                    part_num = self.ROMAN[part_str]
+                else:
+                    try:
+                        part_num = int(part_str)
+                    except ValueError:
+                        continue
+                return base, part_num
+        return None
+
+    @staticmethod
+    def _safe_filename(title):
+        s = re.sub(r'[<>:"/\\|?*]', '', title)
+        return re.sub(r'\s+', ' ', s).strip()
+
+    def link_series(self, vault=False):
+        """Detect multi-part series among downloaded posts and insert Obsidian wiki links.
+
+        Operates on staging_dir by default; pass vault=True to also patch files
+        already moved to the Obsidian vault.
+        """
+        dirs_to_check = [Path(self.config.staging_dir) / 'Medium']
+        if vault and self.config.obsidian_vault:
+            dirs_to_check.append(Path(self.config.obsidian_vault).expanduser() / 'Medium')
+
+        with self.db:
+            posts = self.db.get_posts(status='downloaded')
+
+        if not posts:
+            print("No downloaded posts found.")
+            return
+
+        # Group by detected series base title
+        series: dict[str, list[tuple[int, dict, str]]] = {}
+        unmatched = 0
+        for post in posts:
+            title = post.get('title') or ''
+            result = self._detect_series(title)
+            if result:
+                base, part_num = result
+                series.setdefault(base, []).append((part_num, post, title))
+            else:
+                unmatched += 1
+
+        multi = {b: parts for b, parts in series.items() if len(parts) >= 2}
+        if not multi:
+            print(f"No multi-part series detected among {len(posts)} posts ({unmatched} unmatched).")
+            return
+
+        total_linked = 0
+        for base_title, parts in multi.items():
+            parts.sort(key=lambda x: x[0])
+            print(f"\nSeries: {base_title!r}  ({len(parts)} parts)")
+
+            for i, (part_num, post, title) in enumerate(parts):
+                safe = self._safe_filename(title)
+
+                # Build nav block
+                nav_lines = ['', '---', '', '**Series Navigation**', '']
+                if i > 0:
+                    prev_safe = self._safe_filename(parts[i - 1][2])
+                    nav_lines.append(f'- ← Previous: [[{prev_safe}]]')
+                if i < len(parts) - 1:
+                    next_safe = self._safe_filename(parts[i + 1][2])
+                    nav_lines.append(f'- → Next: [[{next_safe}]]')
+                nav_lines.append('')
+                nav_block = '\n'.join(nav_lines)
+
+                patched = 0
+                for d in dirs_to_check:
+                    filepath = d / f"{safe}.md"
+                    if not filepath.exists():
+                        continue
+                    text = filepath.read_text(encoding='utf-8')
+                    # Strip any previous nav block
+                    marker = '\n---\n\n**Series Navigation**'
+                    if marker in text:
+                        text = text[:text.index(marker)]
+                    filepath.write_text(text.rstrip() + nav_block, encoding='utf-8')
+                    print(f"  Part {part_num}: [[{safe}]]  ✓")
+                    patched += 1
+                    total_linked += 1
+
+                if patched == 0:
+                    print(f"  Part {part_num}: file not found — {safe}.md")
+
+        series_count = len(multi)
+        print(f"\nDone. Linked {total_linked} files across {series_count} series.")
+
     def show_config(self):
         """Display current configuration"""
         print(f"Config file: {self.config.config_file}")
@@ -1653,6 +1766,14 @@ Examples:
     # Retry
     subparsers.add_parser('retry', help='Reset failed posts to pending')
 
+    # Link series
+    link_series_parser = subparsers.add_parser(
+        'link-series',
+        help='Detect multi-part series and add Obsidian [[wiki links]] between them')
+    link_series_parser.add_argument(
+        '--vault', action='store_true',
+        help='Also patch files already moved to the Obsidian vault')
+
     # Config
     config_parser = subparsers.add_parser('config', help='View/set configuration')
     config_parser.add_argument('action', choices=['show', 'set'], help='Action')
@@ -1695,6 +1816,9 @@ Examples:
 
     elif args.command == 'retry':
         manager.retry_failed()
+
+    elif args.command == 'link-series':
+        manager.link_series(vault=args.vault)
 
     elif args.command == 'config':
         if args.action == 'show':
